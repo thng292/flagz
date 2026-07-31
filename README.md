@@ -6,4 +6,4 @@ Build for me.
 
 ## How to use
 
-Copy the content of flagz.zig to your code.
+Copy the content of [src/root.zig](root.zig) to your code.
