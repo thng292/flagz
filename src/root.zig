@@ -265,17 +265,27 @@ pub fn parse(
                     storage.user_input = true;
                     switch (storage.parsed.array) {
                         inline else => |*v, tag| {
-                            try v.append(allocator, @field(try convert(tag, cli_arg), @tagName(tag)));
+                            const converted = convert(tag, cli_arg);
+                            if (converted) |cvt| {
+                                try v.append(allocator, @field(cvt, @tagName(tag)));
+                            } else {
+                                state.arg_count += 1;
+                            }
                         },
                     }
                 },
                 inline else => |_, tag| {
                     storage.user_input = true;
                     storage.parsed = try convert(std.meta.stringToEnum(PrimitiveTypes, @tagName(tag)).?, cli_arg);
+                    state.arg_count += 1;
                 },
+            }
+            if (parse_options.parse_upto_first_positional) {
+                break;
             }
         }
     }
+    result.last_parsed = state.index;
     return result;
 }
 
