@@ -42,7 +42,7 @@ pub const ParsedValue = union(TypesTag) {
 };
 
 pub const Flag = struct {
-    short: u8,
+    short: ?u8 = null,
     long: []const u8,
     description: []const u8,
     type: Types,
@@ -69,10 +69,6 @@ pub const UnknownFlag: Flag = .{
 };
 
 const indent = " " ** 2;
-terminal_width: u32 = 80,
-prog: []const u8,
-brief: []const u8,
-description: []const u8,
 
 flags: []const Flag = &.{},
 positional_args: []const Arg = &.{},
@@ -95,20 +91,14 @@ pub const ParsedResults = struct {
     args: std.StringArrayHashMapUnmanaged(usize),
     last_parsed: usize,
 
-    pub fn getArgResult(
-        self: ParsedResults,
-        name: []const u8,
-    ) ?ParsedItem {
+    pub fn getArgResult(self: ParsedResults, name: []const u8) ?ParsedItem {
         if (self.args.get(name)) |index| {
             return self.backing_storage[index];
         }
         return null;
     }
 
-    pub fn getFlagResult(
-        self: ParsedResults,
-        name: []const u8,
-    ) ?ParsedItem {
+    pub fn getFlagResult(self: ParsedResults, name: []const u8) ?ParsedItem {
         if (self.flags.get(name)) |index| {
             return self.backing_storage[index];
         }
@@ -170,7 +160,9 @@ pub fn parse(
             .user_input = false,
             .parsed = defaultParsedValue(flag.type),
         };
-        try result.flags.put(allocator, (&flag.short)[0..1], i);
+        if (flag.short) |*short| {
+            try result.flags.put(allocator, (short)[0..1], i);
+        }
         try result.flags.put(allocator, flag.long, i);
     }
 
@@ -268,7 +260,7 @@ pub fn parse(
                             const converted = convert(tag, cli_arg);
                             if (converted) |cvt| {
                                 try v.append(allocator, @field(cvt, @tagName(tag)));
-                            } else {
+                            } else |_| {
                                 state.arg_count += 1;
                             }
                         },
@@ -288,6 +280,82 @@ pub fn parse(
     result.last_parsed = state.index;
     return result;
 }
+
+const Meta = struct {
+    Struct: type,
+    parser: Parser,
+
+    pub const CliInfo = struct {
+        kind: Kind,
+        desc: []const u8,
+
+        const Kind = union(enum) {
+            flag: struct { short: ?u8 = null },
+            arg: void,
+        };
+    };
+
+    /// Convert struct to Parser
+    /// Add short and descriptions to `const flagz_cli_info = .{ ... };`
+    pub fn from(
+        comptime Struct: type,
+    ) Meta {
+        const type_info = @typeInfo(Struct).@"struct";
+        for (type_info.fields) |field| {
+            field.defaultValue();
+        }
+        return .{ .Struct = Struct, .parser = .{} };
+    }
+};
+
+const ProgramInfo = struct {
+    prog: []const u8 = "",
+    brief: []const u8 = "",
+    description: []const u8 = "",
+};
+
+pub fn putHelp(self: Parser, info: ProgramInfo, writer: *Io.Writer) !void {
+
+    // brief and desc
+    if (info.brief.len > 0) {
+        try writer.print("{s}\n", .{info.brief});
+    }
+    if (info.description.len > 0) {
+        try writer.print("\n{s}\n\n", .{info.description});
+    }
+
+    // usage
+    try writer.print("Usage: {s} ", .{info.prog});
+    if (info.flags.len > 0) {
+        try writer.print("[OPTIONS]... ", .{});
+    }
+    for (self.positional_args, 0..) |arg, i| {
+        if (i > 0) try writer.print(" ", .{});
+        try printArgName(arg, writer);
+    }
+    try writer.print("\n", .{});
+
+    // Print positional args desc
+    if (self.positional_args.len > 0) {
+        try writer.print("\nPOSITIONAL ARGS:\n", .{});
+    }
+    for (self.positional_args) |arg| {
+        try printArg(arg, writer);
+    }
+
+    // Print flag desc
+    if (self.flags.len > 0) {
+        try writer.print("\nOPTIONS:\n", .{});
+    }
+    for (self.flags) |flag| {
+        try printFlag(flag, writer);
+    }
+    try writer.print("\n", .{});
+    try writer.flush();
+}
+
+/// Handle parsing for both runtime and comptime
+fn _parse() void {}
 
 fn convert(ttype: PrimitiveTypes, value: []const u8) !ParsedValue {
     return switch (ttype) {
@@ -322,45 +390,6 @@ fn defaultParsedValue(ttype: Types) ParsedValue {
             },
         },
     };
-}
-pub fn putHelp(self: Parser, writer: *Io.Writer) !void {
-
-    // brief and desc
-    if (self.brief.len > 0) {
-        try writer.print("{s}\n", .{self.brief});
-    }
-    if (self.description.len > 0) {
-        try writer.print("\n{s}\n\n", .{self.description});
-    }
-
-    // usage
-    try writer.print("Usage: {s} ", .{self.prog});
-    if (self.flags.len > 0) {
-        try writer.print("[OPTIONS]... ", .{});
-    }
-    for (self.positional_args, 0..) |arg, i| {
-        if (i > 0) try writer.print(" ", .{});
-        try printArgName(arg, writer);
-    }
-    try writer.print("\n", .{});
-
-    // Print positional args desc
-    if (self.positional_args.len > 0) {
-        try writer.print("\nPOSITIONAL ARGS:\n", .{});
-    }
-    for (self.positional_args) |arg| {
-        try printArg(arg, writer);
-    }
-
-    // Print flag desc
-    if (self.flags.len > 0) {
-        try writer.print("\nOPTIONS:\n", .{});
-    }
-    for (self.flags) |flag| {
-        try printFlag(flag, writer);
-    }
-    try writer.print("\n", .{});
-    try writer.flush();
 }
 
 fn printArg(arg: Arg, writer: *Io.Writer) !void {
