@@ -61,13 +61,19 @@ pub const HelpFlag: Flag = .{
     .type = .{ .boolean = .{ .default = false } },
 };
 
-pub const UnknownFlag: Flag = .{
-    .description = "Unknown flag",
-    .long = "unknown",
-    .short = 0,
-    .type = .{ .string = .{} },
+const cli_infos_name = "flagz_cli_infos";
+const CliInfosType = std.StaticStringMap(CliInfo);
+pub const CliInfo = struct {
+    kind: Kind,
+    desc: []const u8,
+
+    const Kind = union(enum) {
+        Flag: struct { short: ?u8 = null },
+        Arg: void,
+    };
 };
 
+const MAX_PREFIX_LEN = 512;
 const indent = " " ** 2;
 
 flags: []const Flag = &.{},
@@ -91,27 +97,28 @@ pub const ParsedResults = struct {
     args: std.StringArrayHashMapUnmanaged(usize),
     last_parsed: usize,
 
-    pub fn getArgResult(self: ParsedResults, name: []const u8) ?ParsedItem {
+    pub fn getArg(self: ParsedResults, name: []const u8) ?ParsedItem {
         if (self.args.get(name)) |index| {
             return self.backing_storage[index];
         }
         return null;
     }
-
-    pub fn getFlagResult(self: ParsedResults, name: []const u8) ?ParsedItem {
+    pub fn getFlag(self: ParsedResults, name: []const u8) ?ParsedItem {
         if (self.flags.get(name)) |index| {
             return self.backing_storage[index];
         }
         return null;
     }
 
-    pub fn deinit(self: *ParsedResults, allocator: std.mem.Allocator) void {
-        for (self.backing_storage) |*storage| {
-            switch (storage.parsed) {
-                .array => |*v| switch (v.*) {
-                    inline else => |*vv| vv.deinit(allocator),
-                },
-                else => {},
+    pub fn deinit(self: *ParsedResults, allocator: std.mem.Allocator, option: struct { free_arrays: bool }) void {
+        if (option.free_arrays) {
+            for (self.backing_storage) |*storage| {
+                switch (storage.parsed) {
+                    .array => |*v| switch (v.*) {
+                        inline else => |*vv| vv.deinit(allocator),
+                    },
+                    else => {},
+                }
             }
         }
         allocator.free(self.backing_storage);
@@ -134,10 +141,7 @@ pub fn parse(
     parse_options: ParseOptions,
 ) ParseError!ParsedResults {
     var result: ParsedResults = .{
-        .backing_storage = try allocator.alloc(
-            ParsedItem,
-            self.positional_args.len + self.flags.len,
-        ),
+        .backing_storage = try allocator.alloc(ParsedItem, self.flags.len + self.positional_args.len),
         .args = .empty,
         .flags = .empty,
         .last_parsed = cli_args.len,
@@ -146,7 +150,7 @@ pub fn parse(
     for (result.backing_storage) |*item| {
         item.* = .{ .user_input = false, .parsed = .{ .boolean = false } };
     }
-    errdefer result.deinit(allocator);
+    errdefer result.deinit(allocator, .{ .free_arrays = true });
     // result.args.put(allocator, key: []const u8, value: u32)
     for (self.positional_args, 0..) |arg, i| {
         result.backing_storage[i] = .{
@@ -201,7 +205,10 @@ pub fn parse(
                     .array => {},
                     inline else => |_, tag| result.backing_storage[ii] = .{
                         .user_input = true,
-                        .parsed = try convert(std.meta.stringToEnum(PrimitiveTypes, @tagName(tag)).?, value),
+                        .parsed = try convert(std.meta.stringToEnum(
+                            PrimitiveTypes,
+                            @tagName(tag),
+                        ).?, value),
                     },
                 }
             } else {
@@ -230,7 +237,10 @@ pub fn parse(
                         storage.user_input = true;
                         switch (storage.parsed.array) {
                             inline else => |*v, tag| {
-                                try v.append(allocator, @field(try convert(tag, next), @tagName(tag)));
+                                try v.append(allocator, @field(
+                                    try convert(tag, next),
+                                    @tagName(tag),
+                                ));
                             },
                         }
                     },
@@ -243,7 +253,13 @@ pub fn parse(
                         // Append shit here
                         storage.* = .{
                             .user_input = true,
-                            .parsed = try convert(std.meta.stringToEnum(PrimitiveTypes, @tagName(tag)).?, next),
+                            .parsed = try convert(
+                                std.meta.stringToEnum(
+                                    PrimitiveTypes,
+                                    @tagName(tag),
+                                ).?,
+                                next,
+                            ),
                         };
                     },
                 }
@@ -281,32 +297,144 @@ pub fn parse(
     return result;
 }
 
-const Meta = struct {
-    Struct: type,
-    parser: Parser,
-
-    pub const CliInfo = struct {
-        kind: Kind,
-        desc: []const u8,
-
-        const Kind = union(enum) {
-            flag: struct { short: ?u8 = null },
-            arg: void,
-        };
+/// Add short and descriptions to `const flagz_cli_info = .{ ... };`
+pub fn fromStruct(comptime Struct: type) Parser {
+    const Storage = struct {
+        const tmp = fromStructComptime(Struct);
+    };
+    const parser: Parser = .{
+        .flags = &Storage.tmp.flags,
+        .positional_args = &Storage.tmp.args,
     };
 
-    /// Convert struct to Parser
-    /// Add short and descriptions to `const flagz_cli_info = .{ ... };`
-    pub fn from(
-        comptime Struct: type,
-    ) Meta {
-        const type_info = @typeInfo(Struct).@"struct";
-        for (type_info.fields) |field| {
-            field.defaultValue();
+    return parser;
+}
+
+fn fromStructComptime(comptime Struct: type) struct {
+    flags: [count(Struct).num_flags]Flag,
+    args: [count(Struct).num_args]Arg,
+} {
+    const counts = count(Struct);
+    comptime var _args: [counts.num_args]Arg = undefined;
+    comptime var _flags: [counts.num_flags]Flag = undefined;
+    _fromStruct(Struct, "", &_args, &_flags);
+    return .{ .args = _args, .flags = _flags };
+}
+
+pub fn parseStruct(
+    comptime Struct: type,
+    allocator: std.mem.Allocator,
+    cli_args: []const []const u8,
+    parse_options: ParseOptions,
+) ParseError!Struct {
+    const Storage = struct {
+        const tmp = fromStructComptime(Struct);
+    };
+    const parser: Parser = .{
+        .flags = &Storage.tmp.flags,
+        .positional_args = &Storage.tmp.args,
+    };
+    var parsed = try parser.parse(allocator, cli_args, parse_options);
+    defer parsed.deinit(allocator, .{ .free_arrays = false });
+    var result: Struct = undefined;
+    // Get all the names
+    // inline for (Storage.tmp.args) |arg| {
+    //     var item = parsed.getArg(arg.name).?.parsed;
+    //     @field(result, arg.name) = switch (item) {
+    //         .array => |*v| switch (v.*) {
+    //             inline else => |*array_list| try array_list.toOwnedSlice(allocator),
+    //         },
+    //         inline else => |v| v,
+    //     };
+    // }
+    // inline for (Storage.tmp.flags) |flag| {
+    //     var item = parsed.getFlag(flag.name).?.parsed;
+    //     @field(result, flag.name) = switch (item) {
+    //         .array => |*v| switch (v.*) {
+    //             inline else => |array_list| try array_list.toOwnedSlice(allocator),
+    //         },
+    //         inline else => |v| v,
+    //     };
+    // }
+    // Get all the positional args
+    inline for (Storage.tmp.args) |arg| {
+        var item = parsed.getArg(arg.name).?.parsed;
+        const FieldType = @TypeOf(@field(result, arg.name));
+        const expected_type = comptime typeToTypes(FieldType, null);
+
+        switch (expected_type) {
+            .array => |arr| {
+                // Safely extract just the ArrayList for this specific type
+                var array_list = &@field(item.array, @tagName(arr.child));
+                @field(result, arg.name) = try array_list.toOwnedSlice(allocator);
+            },
+            inline else => |_, tag| {
+                // Safely extract just the primitive value
+                @field(result, arg.name) = @field(item, @tagName(tag));
+            },
         }
-        return .{ .Struct = Struct, .parser = .{} };
     }
-};
+
+    // Get all the flags
+    inline for (Storage.tmp.flags) |flag| {
+        var item = parsed.getFlag(flag.name).?.parsed;
+        const FieldType = @TypeOf(@field(result, flag.name));
+        const expected_type = comptime typeToTypes(FieldType, null);
+
+        switch (expected_type) {
+            .array => |arr| {
+                var array_list = &@field(item.array, @tagName(arr.child));
+                @field(result, flag.name) = try array_list.toOwnedSlice(allocator);
+            },
+            inline else => |_, tag| {
+                @field(result, flag.name) = @field(item, @tagName(tag));
+            },
+        }
+    }
+    return result;
+}
+
+test "count counts nested args and flags" {
+    const Options = struct {
+        input: []const u8,
+        verbose: bool,
+        count: u64,
+
+        const flagz_cli_infos = std.StaticStringMap(CliInfo).initComptime(.{
+            .{ "input", CliInfo{ .kind = .Arg, .desc = "input file" } },
+        });
+    };
+    const Config = struct {
+        input: []const u8,
+        options: Options,
+
+        const flagz_cli_infos = std.StaticStringMap(CliInfo).initComptime(
+            .{.{ "input", CliInfo{ .kind = .Arg, .desc = "input file" } }},
+        );
+    };
+
+    const result = count(Config);
+    try std.testing.expectEqual(2, result.num_args);
+    try std.testing.expectEqual(2, result.num_flags);
+    try std.testing.expectEqual(2, result.max_stack);
+
+    const tmp = fromStruct(Config);
+    try std.testing.expectEqual(2, tmp.positional_args.len);
+    try std.testing.expectEqual(2, tmp.flags.len);
+    var std_err: std.Io.File = .stderr();
+    var buf: [512]u8 = undefined;
+    var std_err_writer = std_err.writer(std.testing.io, &buf);
+    try fromStruct(Config).putHelp(
+        .{
+            .prog = "sthi",
+            .brief = "shittier",
+            .description = "Most shitty",
+        },
+        &std_err_writer.interface,
+    );
+    const config = try parseStruct(Config, std.testing.allocator, &.{}, .{});
+    _ = config;
+}
 
 const ProgramInfo = struct {
     prog: []const u8 = "",
@@ -326,7 +454,7 @@ pub fn putHelp(self: Parser, info: ProgramInfo, writer: *Io.Writer) !void {
 
     // usage
     try writer.print("Usage: {s} ", .{info.prog});
-    if (info.flags.len > 0) {
+    if (self.flags.len > 0) {
         try writer.print("[OPTIONS]... ", .{});
     }
     for (self.positional_args, 0..) |arg, i| {
@@ -354,8 +482,143 @@ pub fn putHelp(self: Parser, info: ProgramInfo, writer: *Io.Writer) !void {
     try writer.flush();
 }
 
-/// Handle parsing for both runtime and comptime
-fn _parse() void {}
+fn _fromStruct(
+    comptime Struct: type,
+    comptime prefix: []const u8,
+    comptime args_slot: *[count(Struct).num_args]Arg,
+    comptime flags_slot: *[count(Struct).num_flags]Flag,
+) void {
+    const cli_infos = getCliInfos(Struct);
+    const type_info = @typeInfo(Struct).@"struct";
+    var arg_counter = 0;
+    var flag_counter = 0;
+
+    for (type_info.fields) |field| {
+        const cli_info = cli_infos.get(field.name);
+        if (@typeInfo(field.type) == .@"struct") {
+            const counts = count(field.type);
+            _fromStruct(
+                field.type,
+                prefix ++ field.name ++ ".",
+                args_slot[arg_counter .. arg_counter + counts.num_args],
+                flags_slot[flag_counter .. flag_counter + counts.num_flags],
+            );
+            arg_counter += counts.num_args;
+            flag_counter += counts.num_flags;
+            continue;
+        }
+        // Normal field
+        if (cli_info) |info| {
+            switch (info.kind) {
+                .Arg => {
+                    args_slot[arg_counter] = Arg{
+                        .name = prefix ++ field.name,
+                        .description = info.desc,
+                        .type = typeToTypes(field.type, field.defaultValue()),
+                    };
+                    arg_counter += 1;
+                },
+                .Flag => |fff| {
+                    flags_slot[flag_counter] = Flag{
+                        .long = prefix ++ field.name,
+                        .short = fff.short,
+                        .description = info.desc,
+                        .type = typeToTypes(field.type, field.defaultValue()),
+                    };
+                    flag_counter += 1;
+                },
+            }
+        } else {
+            // Flag
+            flags_slot[flag_counter] = Flag{
+                .long = prefix ++ field.name,
+                .type = typeToTypes(field.type, field.defaultValue()),
+                .description = "",
+            };
+            flag_counter += 1;
+        }
+    }
+}
+
+fn typeToTypes(comptime T: type, default: ?T) Types {
+    return switch (T) {
+        u64 => Types{ .uint = .{ .default = default } },
+        i64 => Types{ .int = .{ .default = default } },
+        f64 => Types{ .float = .{ .default = default } },
+        bool => Types{ .boolean = .{ .default = default } },
+        []const u8, []u8 => Types{ .string = .{ .default = default } },
+        else => |TT| blk: {
+            const info = @typeInfo(TT);
+            switch (info) {
+                .array => |arr| break :blk Types{ .array = .{
+                    .child = std.meta.stringToEnum(
+                        PrimitiveTypes,
+                        @tagName(typeToTypes(arr.child, null)),
+                    ),
+                    .allow_empty = default != null,
+                } },
+                else => @compileError("Flagz does not support " ++ @typeName(TT)),
+            }
+        },
+    };
+}
+
+fn getCliInfos(comptime Struct: type) CliInfosType {
+    return comptime if (@hasDecl(Struct, cli_infos_name) //
+    and @TypeOf(@field(Struct, cli_infos_name)) == CliInfosType)
+        @field(Struct, cli_infos_name)
+    else
+        CliInfosType.initComptime(.{});
+}
+
+fn count(comptime Struct: type) struct {
+    num_args: comptime_int,
+    num_flags: comptime_int,
+    max_stack: comptime_int,
+} {
+    const type_info = @typeInfo(Struct).@"struct";
+
+    comptime var num_args = 0;
+    comptime var num_flags = 0;
+    comptime var max_stack = 1;
+
+    const cli_infos = getCliInfos(Struct);
+
+    for (type_info.fields) |field| {
+        const cli_info = cli_infos.get(field.name);
+        const is_struct = @typeInfo(field.type) == .@"struct";
+
+        var is_arg = false;
+        if (cli_info) |info| {
+            if (info.kind == .Arg) {
+                is_arg = true;
+            }
+        }
+
+        if (is_struct and is_arg) {
+            @compileError("Struct can not be in args, use string and json");
+        }
+        if (is_arg) {
+            num_args += 1;
+        } else if (!is_struct) {
+            // If is struct then the struct will be multiple flags as struct fields
+            // the struct as a whole is not a flag
+            num_flags += 1;
+        }
+
+        if (is_struct) {
+            const tmp = count(field.type);
+            num_args += tmp.num_args;
+            num_flags += tmp.num_flags;
+            max_stack = @max(max_stack, tmp.max_stack + 1);
+        }
+    }
+    return .{
+        .max_stack = max_stack,
+        .num_flags = num_flags,
+        .num_args = num_args,
+    };
+}
 
 fn convert(ttype: PrimitiveTypes, value: []const u8) !ParsedValue {
     return switch (ttype) {
@@ -405,7 +668,11 @@ fn printArg(arg: Arg, writer: *Io.Writer) !void {
 
 fn printFlag(flag: Flag, writer: *Io.Writer) !void {
     try writer.print(indent, .{});
-    try writer.print("-{c} --{s}", .{ flag.short, flag.long });
+    if (flag.short) |short| {
+        try writer.print("-{c} --{s}", .{ short, flag.long });
+    } else {
+        try writer.print("     --{s}", .{flag.long});
+    }
     try writer.print(" (", .{});
     try printTypeName(flag.type, writer);
     try writer.print(")", .{});

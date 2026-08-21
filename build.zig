@@ -15,14 +15,18 @@ pub fn build(b: *std.Build) void {
     });
 
     zflag_test.addImport("zflag", zflag);
+
     const mod_tests = b.addTest(.{
         .root_module = zflag_test,
     });
+    const mod_tests2 = b.addTest(.{ .root_module = zflag });
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    const run_mod_tests2 = b.addRunArtifact(mod_tests2);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_mod_tests2.step);
 
     const format_step = b.step("fmt", "Format the project");
     format_step.dependOn(&b.addFmt(.{
