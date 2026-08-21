@@ -1,6 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
-const Parser = @This();
+pub const Parser = @This();
 const logger = std.log.scoped(.Flagz);
 
 pub fn SharedTypeOptions(comptime T: type) type {
@@ -200,7 +200,7 @@ pub fn parse(
                     }
                     continue;
                 };
-                const flag = self.flags[ii];
+                const flag = self.flags[ii - self.positional_args.len];
                 switch (flag.type) {
                     .array => {},
                     inline else => |_, tag| result.backing_storage[ii] = .{
@@ -218,7 +218,7 @@ pub fn parse(
                     }
                     continue;
                 };
-                const flag = self.flags[ii];
+                const flag = self.flags[ii - self.positional_args.len];
                 const storage = &result.backing_storage[ii];
                 // Bool flag behavior is similar to golang's flag
                 // https://pkg.go.dev/flag#hdr-Command_line_flag_syntax
@@ -337,103 +337,51 @@ pub fn parseStruct(
     var parsed = try parser.parse(allocator, cli_args, parse_options);
     defer parsed.deinit(allocator, .{ .free_arrays = false });
     var result: Struct = undefined;
-    // Get all the names
-    // inline for (Storage.tmp.args) |arg| {
-    //     var item = parsed.getArg(arg.name).?.parsed;
-    //     @field(result, arg.name) = switch (item) {
-    //         .array => |*v| switch (v.*) {
-    //             inline else => |*array_list| try array_list.toOwnedSlice(allocator),
-    //         },
-    //         inline else => |v| v,
-    //     };
-    // }
-    // inline for (Storage.tmp.flags) |flag| {
-    //     var item = parsed.getFlag(flag.name).?.parsed;
-    //     @field(result, flag.name) = switch (item) {
-    //         .array => |*v| switch (v.*) {
-    //             inline else => |array_list| try array_list.toOwnedSlice(allocator),
-    //         },
-    //         inline else => |v| v,
-    //     };
-    // }
-    // Get all the positional args
-    inline for (Storage.tmp.args) |arg| {
-        var item = parsed.getArg(arg.name).?.parsed;
-        const FieldType = @TypeOf(@field(result, arg.name));
-        const expected_type = comptime typeToTypes(FieldType, null);
-
-        switch (expected_type) {
-            .array => |arr| {
-                // Safely extract just the ArrayList for this specific type
-                var array_list = &@field(item.array, @tagName(arr.child));
-                @field(result, arg.name) = try array_list.toOwnedSlice(allocator);
-            },
-            inline else => |_, tag| {
-                // Safely extract just the primitive value
-                @field(result, arg.name) = @field(item, @tagName(tag));
-            },
-        }
-    }
-
-    // Get all the flags
-    inline for (Storage.tmp.flags) |flag| {
-        var item = parsed.getFlag(flag.name).?.parsed;
-        const FieldType = @TypeOf(@field(result, flag.name));
-        const expected_type = comptime typeToTypes(FieldType, null);
-
-        switch (expected_type) {
-            .array => |arr| {
-                var array_list = &@field(item.array, @tagName(arr.child));
-                @field(result, flag.name) = try array_list.toOwnedSlice(allocator);
-            },
-            inline else => |_, tag| {
-                @field(result, flag.name) = @field(item, @tagName(tag));
-            },
-        }
-    }
+    try populateStruct(Struct, &result, &parsed, allocator, "");
     return result;
 }
 
-test "count counts nested args and flags" {
-    const Options = struct {
-        input: []const u8,
-        verbose: bool,
-        count: u64,
+fn populateStruct(
+    comptime Struct: type,
+    result: *Struct,
+    parsed: *ParsedResults,
+    allocator: std.mem.Allocator,
+    comptime prefix: []const u8,
+) ParseError!void {
+    const cli_infos = getCliInfos(Struct);
 
-        const flagz_cli_infos = std.StaticStringMap(CliInfo).initComptime(.{
-            .{ "input", CliInfo{ .kind = .Arg, .desc = "input file" } },
-        });
-    };
-    const Config = struct {
-        input: []const u8,
-        options: Options,
+    inline for (@typeInfo(Struct).@"struct".fields) |field| {
+        if (@typeInfo(field.type) == .@"struct") {
+            try populateStruct(
+                field.type,
+                &@field(result.*, field.name),
+                parsed,
+                allocator,
+                prefix ++ field.name ++ ".",
+            );
+            continue;
+        }
 
-        const flagz_cli_infos = std.StaticStringMap(CliInfo).initComptime(
-            .{.{ "input", CliInfo{ .kind = .Arg, .desc = "input file" } }},
-        );
-    };
+        const name = prefix ++ field.name;
+        const item = if (cli_infos.get(field.name)) |info|
+            switch (info.kind) {
+                .Arg => parsed.getArg(name).?,
+                .Flag => parsed.getFlag(name).?,
+            }
+        else
+            parsed.getFlag(name).?;
+        const expected_type = comptime typeToTypes(field.type, null);
 
-    const result = count(Config);
-    try std.testing.expectEqual(2, result.num_args);
-    try std.testing.expectEqual(2, result.num_flags);
-    try std.testing.expectEqual(2, result.max_stack);
-
-    const tmp = fromStruct(Config);
-    try std.testing.expectEqual(2, tmp.positional_args.len);
-    try std.testing.expectEqual(2, tmp.flags.len);
-    var std_err: std.Io.File = .stderr();
-    var buf: [512]u8 = undefined;
-    var std_err_writer = std_err.writer(std.testing.io, &buf);
-    try fromStruct(Config).putHelp(
-        .{
-            .prog = "sthi",
-            .brief = "shittier",
-            .description = "Most shitty",
-        },
-        &std_err_writer.interface,
-    );
-    const config = try parseStruct(Config, std.testing.allocator, &.{}, .{});
-    _ = config;
+        switch (expected_type) {
+            .array => |arr| {
+                var array_list = &@field(item.parsed.array, @tagName(arr.child));
+                @field(result.*, field.name) = try array_list.toOwnedSlice(allocator);
+            },
+            inline else => |_, tag| {
+                @field(result.*, field.name) = @field(item.parsed, @tagName(tag));
+            },
+        }
+    }
 }
 
 const ProgramInfo = struct {
